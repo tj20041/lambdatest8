@@ -20,20 +20,25 @@ class StatisticalAnomalyDetector:
             return {"readings_count": n, "anomalies": []}
 
         mean = sum(readings) / n
-        
+
         # Computing variance via standard deviation formula
-        # Float rounding errors can cause total_variance to evaluate to a tiny negative number
-        # when all elements in 'readings' are identical
+        # Float rounding errors can cause variance to evaluate to a tiny negative number
+        # when all elements in 'readings' are identical; clamp to 0.0 before sqrt.
         variance = sum((x - mean) ** 2 for x in readings) / (n - 1)
 
         logger.info(f"Stream count: {n}, Calculated Mean: {mean}, Raw Variance: {variance}")
 
-        # Simulating floating point instability in variance calculation
-        corrupted_variance = variance - 0.000000000000005
+        # Defence-in-depth clamp: ensure any floating-point underflow never produces
+        # a negative value passed to math.sqrt, which would raise ValueError.
+        safe_variance = max(0.0, variance)
 
-        # FAILS HERE: If corrupted_variance is negative (< 0), math.sqrt raises:
-        # ValueError: math domain error
-        std_dev = math.sqrt(corrupted_variance)
+        std_dev = math.sqrt(safe_variance)
+
+        if std_dev == 0:
+            logger.warning(
+                "std_dev is zero — all readings are identical; "
+                "skipping z-score anomaly detection"
+            )
 
         anomalies = []
         for val in readings:
@@ -43,17 +48,51 @@ class StatisticalAnomalyDetector:
 
         return {"mean": mean, "std_dev": std_dev, "anomalies": anomalies}
 
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Processing IoT sensor window readings...")
 
-    # Static sensor array with constant temperature readings
-    simulated_readings = [21.5, 21.5, 21.5, 21.5, 21.5]
+    # Read readings from the Lambda event payload so the function processes
+    # real sensor data rather than a hardcoded constant array.
+    readings = event.get("readings", [])
+
+    # Input validation: reject empty or non-list input with a 400 response.
+    if not isinstance(readings, list) or len(readings) < 2:
+        logger.error(
+            "Invalid input: 'readings' must be a list with at least 2 numeric values. "
+            "Received: %s", readings
+        )
+        return {
+            "statusCode": 400,
+            "error": "invalid_input",
+            "detail": "'readings' must be a list of at least 2 numeric values.",
+        }
+
+    # Validate that every element is a real number.
+    if not all(isinstance(v, (int, float)) for v in readings):
+        logger.error("Invalid input: all values in 'readings' must be numeric.")
+        return {
+            "statusCode": 400,
+            "error": "invalid_input",
+            "detail": "All values in 'readings' must be numeric (int or float).",
+        }
 
     detector = StatisticalAnomalyDetector(threshold_sigma=2.5)
-    report = detector.evaluate_metric_stream(simulated_readings)
+
+    try:
+        report = detector.evaluate_metric_stream(readings)
+    except ValueError as exc:
+        logger.error("Anomaly detection failed: %s", exc, exc_info=True)
+        return {
+            "statusCode": 500,
+            "error": "anomaly_detection_failed",
+            "detail": str(exc),
+        }
 
     logger.info("Anomaly detection completed successfully")
     return {"statusCode": 200, "report": report}
 
+
 if __name__ == "__main__":
-    lambda_handler({}, None)
+    # Example invocation with non-constant readings for local testing.
+    lambda_handler({"readings": [21.5, 22.0, 21.8, 23.1, 21.5]}, None)
