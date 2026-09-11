@@ -20,7 +20,7 @@ class StatisticalAnomalyDetector:
             return {"readings_count": n, "anomalies": []}
 
         mean = sum(readings) / n
-        
+
         # Computing variance via standard deviation formula
         # Float rounding errors can cause total_variance to evaluate to a tiny negative number
         # when all elements in 'readings' are identical
@@ -28,12 +28,18 @@ class StatisticalAnomalyDetector:
 
         logger.info(f"Stream count: {n}, Calculated Mean: {mean}, Raw Variance: {variance}")
 
-        # Simulating floating point instability in variance calculation
-        corrupted_variance = variance - 0.000000000000005
+        # Simulating floating point instability in variance calculation.
+        # NOTE: This epsilon subtraction is retained only to emulate real-world
+        # floating point noise seen from upstream sensors. Since variance is
+        # mathematically guaranteed to be >= 0, but the epsilon can push it
+        # slightly below zero for zero/near-zero variance inputs (e.g. constant
+        # readings), we clamp the result to a non-negative floor before it is
+        # ever used, so math.sqrt never receives a negative argument.
+        corrupted_variance = max(variance - 0.000000000000005, 0.0)
 
-        # FAILS HERE: If corrupted_variance is negative (< 0), math.sqrt raises:
-        # ValueError: math domain error
-        std_dev = math.sqrt(corrupted_variance)
+        # Defensive guard kept in addition to the clamp above so this remains
+        # safe even if the epsilon-subtraction logic above changes later.
+        std_dev = math.sqrt(max(corrupted_variance, 0.0))
 
         anomalies = []
         for val in readings:
@@ -50,7 +56,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     simulated_readings = [21.5, 21.5, 21.5, 21.5, 21.5]
 
     detector = StatisticalAnomalyDetector(threshold_sigma=2.5)
-    report = detector.evaluate_metric_stream(simulated_readings)
+
+    try:
+        report = detector.evaluate_metric_stream(simulated_readings)
+    except ValueError as exc:
+        logger.error(f"Anomaly detection failed due to ValueError: {exc}", exc_info=True)
+        return {"statusCode": 500, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - defensive catch-all for unexpected stats errors
+        logger.error(f"Anomaly detection failed unexpectedly: {exc}", exc_info=True)
+        return {"statusCode": 500, "error": str(exc)}
 
     logger.info("Anomaly detection completed successfully")
     return {"statusCode": 200, "report": report}
